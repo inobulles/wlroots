@@ -32,5 +32,12 @@ void wlr_vk_texture_get_image_attribs(struct wlr_texture *texture,
 	struct wlr_vk_image_attribs *attribs);
 bool wlr_vk_texture_has_alpha(struct wlr_texture *texture);
 
+/*
+ * Called around code that accesses this texture from a different renderer's queue.
+ */
+bool wlr_vk_texture_begin_external(struct wlr_texture *texture,
+	struct wlr_vk_image_attribs *attribs);
+bool wlr_vk_renderer_end_external(struct wlr_renderer *renderer);
+
 #endif
 

@@ -484,7 +484,8 @@ VkSemaphore vulkan_command_buffer_wait_sync_file(struct wlr_vk_renderer *rendere
 	return *sem_ptr;
 }
 
-bool vulkan_submit_stage_wait(struct wlr_vk_renderer *renderer, int wait_sync_file_fd) {
+static bool submit_stage(struct wlr_vk_renderer *renderer, int wait_sync_file_fd,
+		struct wlr_vk_command_buffer **submitted_cb) {
 	if (renderer->stage.cb == NULL) {
 		return false;
 	}
@@ -531,12 +532,22 @@ bool vulkan_submit_stage_wait(struct wlr_vk_renderer *renderer, int wait_sync_fi
 		return false;
 	}
 
+	*submitted_cb = cb;
+	return true;
+}
+
+bool vulkan_submit_stage_wait(struct wlr_vk_renderer *renderer, int wait_sync_file_fd) {
+	struct wlr_vk_command_buffer *cb;
+	if (!submit_stage(renderer, wait_sync_file_fd, &cb)) {
+		return false;
+	}
+
 	if (!vulkan_wait_command_buffer(cb, renderer)) {
 		return false;
 	}
 
 	// We did a blocking wait so this is now the current point
-	stage_buffer_gc(renderer, timeline_point);
+	stage_buffer_gc(renderer, cb->timeline_point);
 	return true;
 }
 
@@ -2862,4 +2873,87 @@ VkDevice wlr_vk_renderer_get_device(struct wlr_renderer *renderer) {
 uint32_t wlr_vk_renderer_get_queue_family(struct wlr_renderer *renderer) {
 	struct wlr_vk_renderer *vk_renderer = vulkan_get_renderer(renderer);
 	return vk_renderer->dev->queue_family;
+}
+
+bool wlr_vk_texture_begin_external(struct wlr_texture *wlr_texture,
+		struct wlr_vk_image_attribs *attribs) {
+	struct wlr_vk_texture *texture = vulkan_get_texture(wlr_texture);
+	struct wlr_vk_renderer *renderer = texture->renderer;
+
+	// Submit staging command buffer.
+
+	struct wlr_vk_command_buffer *stage_cb;
+	if (renderer->stage.cb != NULL && !submit_stage(renderer, -1, &stage_cb)) {
+		return false;
+	}
+
+	if (renderer->external_cb != NULL) {
+		goto have_ext_cb;
+	}
+
+	// Create external command buffer if we don't have one on the renderer already.
+
+	struct wlr_vk_command_buffer *cb = vulkan_acquire_command_buffer(renderer);
+	if (cb == NULL) {
+		return false;
+	}
+
+	VkCommandBufferBeginInfo begin_info = {
+		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	VkResult res = vkBeginCommandBuffer(cb->vk, &begin_info);
+	if (res != VK_SUCCESS) {
+		wlr_vk_error("vkBeginCommandBuffer", res);
+		cb->recording = false;
+		return false;
+	}
+
+	renderer->external_cb = cb;
+
+have_ext_cb:
+
+	// Texture won't be destroyed until external command buffer ends.
+
+	texture->last_used_cb = renderer->external_cb;
+	wlr_vk_texture_get_image_attribs(wlr_texture, attribs);
+
+	return true;
+}
+
+bool wlr_vk_renderer_end_external(struct wlr_renderer *wlr_renderer) {
+	struct wlr_vk_renderer *renderer = vulkan_get_renderer(wlr_renderer);
+
+	struct wlr_vk_command_buffer *cb = renderer->external_cb;
+	if (cb == NULL) {
+		return true;
+	}
+	renderer->external_cb = NULL;
+
+	uint64_t timeline_point = vulkan_end_command_buffer(cb, renderer);
+	if (timeline_point == 0) {
+		return false;
+	}
+
+	VkTimelineSemaphoreSubmitInfoKHR timeline_submit_info = {
+		.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR,
+		.signalSemaphoreValueCount = 1,
+		.pSignalSemaphoreValues = &timeline_point,
+	};
+	VkSubmitInfo submit_info = {
+		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+		.pNext = &timeline_submit_info,
+		.commandBufferCount = 1,
+		.pCommandBuffers = &cb->vk,
+		.signalSemaphoreCount = 1,
+		.pSignalSemaphores = &renderer->timeline_semaphore,
+	};
+
+	VkResult res = vkQueueSubmit(renderer->dev->queue, 1, &submit_info, VK_NULL_HANDLE);
+	if (res != VK_SUCCESS) {
+		wlr_vk_error("vkQueueSubmit", res);
+		return false;
+	}
+
+	return true;
 }

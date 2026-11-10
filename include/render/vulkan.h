@@ -354,6 +354,8 @@ struct wlr_vk_renderer {
 		struct wl_list buffers; // wlr_vk_stage_buffer.link
 	} stage;
 
+	struct wlr_vk_command_buffer *external_cb;
+
 	struct {
 		bool initialized;
 		uint32_t drm_format;
