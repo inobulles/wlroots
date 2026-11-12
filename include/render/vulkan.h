@@ -355,6 +355,7 @@ struct wlr_vk_renderer {
 	} stage;
 
 	struct wlr_vk_command_buffer *external_cb;
+	struct wl_array external_buffers; // struct wlr_vk_render_buffer *
 
 	struct {
 		bool initialized;
