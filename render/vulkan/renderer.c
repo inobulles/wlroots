@@ -484,8 +484,15 @@ VkSemaphore vulkan_command_buffer_wait_sync_file(struct wlr_vk_renderer *rendere
 	return *sem_ptr;
 }
 
-bool vulkan_submit_stage_wait(struct wlr_vk_renderer *renderer, int wait_sync_file_fd) {
+static bool submit_stage(struct wlr_vk_renderer *renderer,
+		int const *wait_sync_file_fds, size_t wait_sync_file_fds_len,
+		struct wlr_vk_command_buffer **submitted_cb) {
 	if (renderer->stage.cb == NULL) {
+		for (size_t i = 0; i < wait_sync_file_fds_len; i++) {
+			if (wait_sync_file_fds[i] >= 0) {
+				close(wait_sync_file_fds[i]);
+			}
+		}
 		return false;
 	}
 
@@ -497,8 +504,9 @@ bool vulkan_submit_stage_wait(struct wlr_vk_renderer *renderer, int wait_sync_fi
 		return false;
 	}
 
-	VkSemaphore wait_semaphore;
-	VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+	VkSemaphore wait_semaphores[WLR_DMABUF_MAX_PLANES];
+	VkPipelineStageFlags wait_stages[WLR_DMABUF_MAX_PLANES];
+	assert(wait_sync_file_fds_len <= WLR_DMABUF_MAX_PLANES);
 	VkTimelineSemaphoreSubmitInfoKHR timeline_submit_info = {
 		.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR,
 		.signalSemaphoreValueCount = 1,
@@ -513,14 +521,27 @@ bool vulkan_submit_stage_wait(struct wlr_vk_renderer *renderer, int wait_sync_fi
 		.pSignalSemaphores = &renderer->timeline_semaphore,
 	};
 
-	if (wait_sync_file_fd != -1) {
-		wait_semaphore = vulkan_command_buffer_wait_sync_file(renderer, cb, 0, wait_sync_file_fd);
-		if (wait_semaphore == VK_NULL_HANDLE) {
-			return false;
+	uint32_t wait_len = 0;
+	for (size_t i = 0; i < wait_sync_file_fds_len; i++) {
+		int const fd = wait_sync_file_fds[i];
+		if (fd < 0) {
+			continue;
 		}
-		submit_info.waitSemaphoreCount = 1;
-		submit_info.pWaitSemaphores = &wait_semaphore;
-		submit_info.pWaitDstStageMask = &wait_stage;
+
+		VkSemaphore const sem = vulkan_command_buffer_wait_sync_file(renderer,
+			cb, wait_len, wait_sync_file_fds[i]);
+		if (sem == VK_NULL_HANDLE) {
+			close(wait_sync_file_fds[i]);
+			continue;
+		}
+		wait_semaphores[wait_len] = sem;
+		wait_stages[wait_len] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+		wait_len++;
+	}
+	if (wait_len > 0) {
+		submit_info.waitSemaphoreCount = wait_len;
+		submit_info.pWaitSemaphores = wait_semaphores;
+		submit_info.pWaitDstStageMask = wait_stages;
 	}
 
 	vulkan_stage_mark_submit(renderer, timeline_point);
@@ -531,12 +552,22 @@ bool vulkan_submit_stage_wait(struct wlr_vk_renderer *renderer, int wait_sync_fi
 		return false;
 	}
 
+	*submitted_cb = cb;
+	return true;
+}
+
+bool vulkan_submit_stage_wait(struct wlr_vk_renderer *renderer, int wait_sync_file_fd) {
+	struct wlr_vk_command_buffer *cb;
+	if (!submit_stage(renderer, &wait_sync_file_fd, 1, &cb)) {
+		return false;
+	}
+
 	if (!vulkan_wait_command_buffer(cb, renderer)) {
 		return false;
 	}
 
 	// We did a blocking wait so this is now the current point
-	stage_buffer_gc(renderer, timeline_point);
+	stage_buffer_gc(renderer, cb->timeline_point);
 	return true;
 }
 
@@ -1253,6 +1284,12 @@ static void vulkan_destroy(struct wlr_renderer *wlr_renderer) {
 	wl_list_for_each_safe(tex, tex_tmp, &renderer->textures, link) {
 		vulkan_texture_destroy(tex);
 	}
+
+	struct wlr_vk_render_buffer **external_buffer;
+	wl_array_for_each(external_buffer, &renderer->external_buffers) {
+		wlr_buffer_unlock((*external_buffer)->wlr_buffer);
+	}
+	wl_array_release(&renderer->external_buffers);
 
 	struct wlr_vk_render_buffer *render_buffer, *render_buffer_tmp;
 	wl_list_for_each_safe(render_buffer, render_buffer_tmp,
@@ -2756,6 +2793,7 @@ struct wlr_renderer *vulkan_renderer_create_for_device(struct wlr_vk_device *dev
 	wl_list_init(&renderer->output_descriptor_pools);
 	wl_list_init(&renderer->render_format_setups);
 	wl_list_init(&renderer->render_buffers);
+	wl_array_init(&renderer->external_buffers);
 	wl_list_init(&renderer->color_transforms);
 	wl_list_init(&renderer->pipeline_layouts);
 
@@ -2862,4 +2900,291 @@ VkDevice wlr_vk_renderer_get_device(struct wlr_renderer *renderer) {
 uint32_t wlr_vk_renderer_get_queue_family(struct wlr_renderer *renderer) {
 	struct wlr_vk_renderer *vk_renderer = vulkan_get_renderer(renderer);
 	return vk_renderer->dev->queue_family;
+}
+
+static struct wlr_vk_command_buffer *get_external_cb(
+		struct wlr_vk_renderer *renderer) {
+	if (renderer->external_cb != NULL) {
+		return renderer->external_cb;
+	}
+
+	struct wlr_vk_command_buffer *cb = vulkan_acquire_command_buffer(renderer);
+	if (cb == NULL) {
+		return NULL;
+	}
+
+	VkCommandBufferBeginInfo begin_info = {
+		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	VkResult res = vkBeginCommandBuffer(cb->vk, &begin_info);
+	if (res != VK_SUCCESS) {
+		wlr_vk_error("vkBeginCommandBuffer", res);
+		cb->recording = false;
+		return NULL;
+	}
+
+	renderer->external_cb = cb;
+	return cb;
+}
+
+bool wlr_vk_texture_begin_external(struct wlr_texture *wlr_texture,
+		struct wlr_vk_image_attribs *attribs) {
+	struct wlr_vk_texture *texture = vulkan_get_texture(wlr_texture);
+	struct wlr_vk_renderer *renderer = texture->renderer;
+
+	// Submit staging command buffer.
+
+	struct wlr_vk_command_buffer *stage_cb;
+	if (renderer->stage.cb != NULL && !submit_stage(renderer, NULL, 0, &stage_cb)) {
+		return false;
+	}
+
+	struct wlr_vk_command_buffer *cb = get_external_cb(renderer);
+	if (cb == NULL) {
+		return false;
+	}
+
+	// Texture won't be destroyed until external command buffer ends.
+
+	texture->last_used_cb = renderer->external_cb;
+	wlr_vk_texture_get_image_attribs(wlr_texture, attribs);
+
+	return true;
+}
+
+bool wlr_vk_buffer_begin_external(struct wlr_renderer *wlr_renderer,
+		struct wlr_buffer *wlr_buffer, struct wlr_vk_image_attribs *attribs) {
+	struct wlr_vk_renderer *renderer = vulkan_get_renderer(wlr_renderer);
+
+	// Import the buffer just like how vulkan_begin_buffer_pass() would.
+
+	struct wlr_vk_render_buffer *buffer = get_render_buffer(renderer, wlr_buffer);
+	if (buffer == NULL) {
+		buffer = create_render_buffer(renderer, wlr_buffer);
+		if (buffer == NULL) {
+			return false;
+		}
+	}
+
+	struct wlr_dmabuf_attributes dmabuf = {0};
+	if (!wlr_buffer_get_dmabuf(wlr_buffer, &dmabuf)) {
+		return false;
+	}
+	struct wlr_vk_format_props const *fmt =
+		vulkan_format_props_from_drm(renderer->dev, dmabuf.format);
+	if (fmt == NULL) {
+		return false;
+	}
+
+	// The external command buffer (from custom renderer) must exist.
+	// We use it later.
+
+	if (get_external_cb(renderer) == NULL) {
+		return false;
+	}
+
+	VkCommandBuffer stage_vk = vulkan_record_stage_cb(renderer);
+	if (stage_vk == VK_NULL_HANDLE) {
+		return false;
+	}
+
+	int sync_file_fds[WLR_DMABUF_MAX_PLANES];
+	for (size_t i = 0; i < WLR_DMABUF_MAX_PLANES; i++) {
+		sync_file_fds[i] = -1;
+	}
+	if (!vulkan_sync_render_buffer_acquire(buffer, sync_file_fds)) {
+		wlr_log(WLR_ERROR, "Failed to wait for render buffer DMA-BUF fence");
+	}
+
+	bool const transitioned = buffer->linear.out.transitioned ||
+		buffer->srgb.out.transitioned || buffer->two_pass.out.transitioned;
+	VkImageMemoryBarrier barrier = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		.srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT,
+		.dstQueueFamilyIndex = renderer->dev->queue_family,
+		.image = buffer->image,
+		.oldLayout = transitioned ?
+			VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_PREINITIALIZED,
+		.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		.srcAccessMask = 0,
+		.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+			VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+		.subresourceRange.layerCount = 1,
+		.subresourceRange.levelCount = 1,
+	};
+	vkCmdPipelineBarrier(stage_vk, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+		VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
+
+	struct wlr_vk_command_buffer *stage_cb;
+	if (!submit_stage(renderer, sync_file_fds, WLR_DMABUF_MAX_PLANES, &stage_cb)) {
+		return false;
+	}
+
+	struct wlr_vk_render_buffer **entry =
+		wl_array_add(&renderer->external_buffers, sizeof(*entry));
+	if (entry == NULL) {
+		wlr_log_errno(WLR_ERROR, "Allocation failed");
+		return false;
+	}
+	*entry = buffer;
+	wlr_buffer_lock(wlr_buffer);
+
+	*attribs = (struct wlr_vk_image_attribs){
+		.image = buffer->image,
+		.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		.format = fmt->format.vk,
+	};
+	return true;
+}
+
+bool wlr_vk_renderer_end_external(struct wlr_renderer *wlr_renderer,
+		struct wlr_drm_syncobj_timeline *signal_timeline, uint64_t signal_point) {
+	bool ok = false;
+	struct wlr_vk_renderer *renderer = vulkan_get_renderer(wlr_renderer);
+
+	struct wlr_vk_render_buffer **buffers = renderer->external_buffers.data;
+	size_t buffers_len = renderer->external_buffers.size / sizeof *buffers;
+
+	struct wlr_vk_command_buffer *cb = signal_timeline == NULL
+	                                       ? renderer->external_cb
+	                                       : get_external_cb(renderer);
+	if (cb == NULL) {
+		return signal_timeline == NULL;
+	}
+	renderer->external_cb = NULL;
+
+	// Release buffers back to foreign queue family.
+
+	if (buffers_len == 0) {
+		goto no_bufs;
+	}
+
+	VkImageMemoryBarrier *const barriers = calloc(buffers_len, sizeof *barriers);
+	assert(barriers != NULL);
+
+	for (size_t i = 0; i < buffers_len; i++) {
+		barriers[i] = (VkImageMemoryBarrier){
+			.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			.srcQueueFamilyIndex = renderer->dev->queue_family,
+			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT,
+			.image = buffers[i]->image,
+			.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, // We assume the custom renderer left this as-is!!
+			.newLayout = VK_IMAGE_LAYOUT_GENERAL,
+			.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+			.dstAccessMask = 0,
+			.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			.subresourceRange.layerCount = 1,
+			.subresourceRange.levelCount = 1,
+		};
+	}
+
+	vkCmdPipelineBarrier(cb->vk, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+	                     VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0,
+	                     NULL, buffers_len, barriers);
+	free(barriers);
+
+no_bufs:
+	uint64_t timeline_point = vulkan_end_command_buffer(cb, renderer);
+	if (timeline_point == 0) {
+		goto out;
+	}
+
+	bool export_sync_file = signal_timeline != NULL ||
+		(buffers_len > 0 && renderer->dev->implicit_sync_interop);
+
+	VkSemaphore signal_semaphores[2] = { renderer->timeline_semaphore };
+	uint64_t signal_values[2] = { timeline_point };
+	uint32_t signal_len = 1;
+
+	if (export_sync_file) {
+		if (cb->binary_semaphore == VK_NULL_HANDLE) {
+			VkExportSemaphoreCreateInfo export_info = {
+				.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+				.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+			};
+			VkSemaphoreCreateInfo semaphore_info = {
+				.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+				.pNext = &export_info,
+			};
+			VkResult res = vkCreateSemaphore(renderer->dev->dev, &semaphore_info,
+				NULL, &cb->binary_semaphore);
+			if (res != VK_SUCCESS) {
+				wlr_vk_error("vkCreateSemaphore", res);
+				export_sync_file = false;
+			}
+		}
+
+		if (export_sync_file) {
+			signal_len = 2;
+			signal_semaphores[1] = cb->binary_semaphore;
+		}
+	}
+
+	VkTimelineSemaphoreSubmitInfoKHR timeline_submit_info = {
+		.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR,
+		.signalSemaphoreValueCount = signal_len,
+		.pSignalSemaphoreValues = signal_values,
+	};
+	VkSubmitInfo submit_info = {
+		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+		.pNext = &timeline_submit_info,
+		.commandBufferCount = 1,
+		.pCommandBuffers = &cb->vk,
+		.signalSemaphoreCount = signal_len,
+		.pSignalSemaphores = signal_semaphores,
+	};
+
+	VkResult res = vkQueueSubmit(renderer->dev->queue, 1, &submit_info, VK_NULL_HANDLE);
+	if (res != VK_SUCCESS) {
+		wlr_vk_error("vkQueueSubmit", res);
+		goto out;
+	}
+
+	if (!export_sync_file) {
+		ok = vulkan_wait_command_buffer(cb, renderer);
+		if (signal_timeline != NULL) {
+			wlr_log(WLR_ERROR, "Failed to export sync file to signal timeline");
+			ok = false;
+		}
+		goto out;
+	}
+
+	VkSemaphoreGetFdInfoKHR const get_fence_fd_info = {
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+		.semaphore = cb->binary_semaphore,
+		.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+	};
+	int sync_file_fd = -1;
+	res = renderer->dev->api.vkGetSemaphoreFdKHR(renderer->dev->dev,
+		&get_fence_fd_info, &sync_file_fd);
+	if (res != VK_SUCCESS) {
+		wlr_vk_error("vkGetSemaphoreFdKHR", res);
+		goto out;
+	}
+
+	ok = true;
+	if (signal_timeline != NULL) {
+		ok = wlr_drm_syncobj_timeline_import_sync_file(signal_timeline,
+			signal_point, sync_file_fd);
+	} else {
+		for (size_t i = 0; i < buffers_len; i++) {
+			ok = buffer_import_sync_file(buffers[i]->wlr_buffer,
+				DMA_BUF_SYNC_WRITE, sync_file_fd) && ok;
+		}
+	}
+	close(sync_file_fd);
+
+out:
+	for (size_t i = 0; i < buffers_len; i++) {
+		struct wlr_vk_render_buffer *buffer = buffers[i];
+
+		buffer->linear.out.transitioned = true;
+		buffer->srgb.out.transitioned = true;
+		buffer->two_pass.out.transitioned = true;
+		wlr_buffer_unlock(buffer->wlr_buffer);
+	}
+	renderer->external_buffers.size = 0;
+	return ok;
 }
